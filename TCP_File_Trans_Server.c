@@ -11,50 +11,37 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/time.h>
-#include <sys/time.h>
 
 #pragma pack(push, 1)
 
-
 typedef struct 
 {
-	char name[101];  // 文件名最大长度不超过 100 字节
-	uint32_t mode;   // 文件模式
-	uint64_t size;   // 文件大小
-	// ......        // 更多文件属性可以扩展	
-
+	char name[101];
+	uint32_t mode;
+	uint64_t size;
+	uint64_t offset;
+	uint8_t enable_resume;
 } file_info_t;
 
-
 #pragma pack(pop)
-
-
 
 typedef struct
 {
 	int sock_conn;
 	char ip[16];
 	unsigned short port;
-	time_t online_time;     // 上线时间
-	char** send_file_list;  // 待发送的文件路径列表
-	int send_file_cnt;      // 待发送的文件数量
-	// char user_name[50];  // 用户名
-	//......
-
+	time_t online_time;
+	char** send_file_list;
+	int send_file_cnt;
 } client_info_t;
 
-
-
 void* comm_thr(void* arg);
-int send_file(int sock, const char* file_path);
-
-
+int send_file_with_offset(int sock, const char* file_path, uint64_t offset);
 
 int main(int argc, char** argv)
 {
 	signal(SIGPIPE, SIG_IGN);
 
-	// 校验参数
 	if(argc == 1)
 	{
 		fprintf(stderr, "Usage: %s file1 [...]\n", argv[0]);
@@ -70,7 +57,6 @@ int main(int argc, char** argv)
 		}
 	}
 
-	// 第 1 步：创建监听套接字
 	int sock_listen = socket(AF_INET, SOCK_STREAM, 0);
 
 	if(-1 == sock_listen)
@@ -79,40 +65,26 @@ int main(int argc, char** argv)
 		exit(1);
 	}
 
-
-	// 开启地址复用，以允许服务器快速重启
 	int val = 1;
 	setsockopt(sock_listen, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 
-
-	// 第 2 步：绑定地址
-
-	// 指定地址
 	struct sockaddr_in myaddr;
-	myaddr.sin_family = AF_INET;          // 指定地址家族(AF)为 Internet 地址家族
-	myaddr.sin_addr.s_addr = INADDR_ANY;  // 指定 IP 地址为本机任意地址
-	//myaddr.sin_addr.s_addr = inet_addr("172.16.251.96");  // 指定 IP 地址为本机的某个具体 IP 地址
-	myaddr.sin_port = htons(9413);        // 指定端口号为 9413
-	
-	//printf("%hu\n", htons(6666));  // 2586
+	myaddr.sin_family = AF_INET;
+	myaddr.sin_addr.s_addr = INADDR_ANY;
+	myaddr.sin_port = htons(9413);
 
-	// 绑定
 	if(-1 == bind(sock_listen, (struct sockaddr*)&myaddr, sizeof(myaddr)))
 	{
 		perror("bind fail");
 		exit(1);
 	}
 
-
-	// 第 3 步：监听
 	if(-1 == listen(sock_listen, 5))
 	{
 		perror("listen fail");
 		exit(1);
 	}
 
-	// 第 4 步：接收客户端连接请求
-	
 	int sock_conn;
 	pthread_t tid;
 	client_info_t* pci = NULL;
@@ -120,9 +92,14 @@ int main(int argc, char** argv)
 	socklen_t addr_len = sizeof(client_addr);
 
 	struct timeval tv;
-	tv.tv_sec = 10;
+	tv.tv_sec = 30;
 	tv.tv_usec = 0;
 
+	printf("服务端已启动，监听端口 9413...\n");
+	printf("待发送文件: ");
+	for(int i = 1; i < argc; i++)
+		printf("%s ", argv[i]);
+	printf("\n");
 
 	while(1)
 	{	
@@ -131,7 +108,7 @@ int main(int argc, char** argv)
 		if(-1 == sock_conn)
 		{
 			perror("accept fail");
-			exit(1);
+			continue;
 		}
 
 		pci = malloc(sizeof(client_info_t));
@@ -143,7 +120,6 @@ int main(int argc, char** argv)
 			continue;
 		}
 
-		// 获取当前上线的客户端信息
 		pci->sock_conn = sock_conn;
 		strcpy(pci->ip, inet_ntoa(client_addr.sin_addr));
 		pci->port = ntohs(client_addr.sin_port);
@@ -154,25 +130,18 @@ int main(int argc, char** argv)
 		if(pthread_create(&tid, NULL, comm_thr, pci))
 		{
 			perror("pthread_create fail");
-
 			free(pci);
 			close(sock_conn);
 			continue;
 		}
 
-		// 设置接收超时
 		setsockopt(sock_conn, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 	}
 
-	// 第 7 步：关闭监听套接字
 	close(sock_listen);
-
 	return 0;
 }
 
-
-
-// 定义通信线程函数
 void* comm_thr(void* arg)
 {
 	client_info_t* pci = (client_info_t*)arg;
@@ -182,96 +151,131 @@ void* comm_thr(void* arg)
 
 	printf("\n客户端(%s:%hu)上线...\n", pci->ip, pci->port);
 
-	// 第 5 步：收发数据
 	for(i = 0; i < pci->send_file_cnt; i++)
 	{
-		if((err_code = send_file(pci->sock_conn, pci->send_file_list[i])) != 0)
+		file_info_t fi;
+		ssize_t ret;
+
+		memset(&fi, 0, sizeof(fi));
+
+		struct stat st;
+		if(lstat(pci->send_file_list[i], &st) == -1)
 		{
-			printf("\n向客户端(%s:%hu)发送 %s 文件失败(Error code: %d)！\n", pci->ip, pci->port, pci->send_file_list[i], err_code);
+			perror("lstat fail");
+			err_code = 1;
+			break;
+		}
+
+		fi.mode = st.st_mode;
+		fi.size = st.st_size;
+		fi.enable_resume = 1;
+
+		const char* file_name = strrchr(pci->send_file_list[i], '/');
+		if(file_name == NULL)
+			file_name = pci->send_file_list[i];
+		else
+			file_name++;
+		strncpy(fi.name, file_name, sizeof(fi.name) - 1);
+
+		printf("\n准备发送文件: %s (%lu 字节)\n", fi.name, fi.size);
+
+		if(write(pci->sock_conn, &fi, sizeof(fi)) != sizeof(fi))
+		{
+			fprintf(stderr, "send file info fail\n");
+			err_code = 2;
+			break;
+		}
+
+		file_info_t client_req;
+		ret = read(pci->sock_conn, &client_req, sizeof(client_req));
+		if(ret != sizeof(client_req))
+		{
+			fprintf(stderr, "recv client request fail\n");
+			err_code = 3;
+			break;
+		}
+
+		printf("客户端请求偏移: %lu 字节\n", client_req.offset);
+
+		if(client_req.offset >= fi.size)
+		{
+			printf("文件已完整，跳过发送\n");
+			continue;
+		}
+
+		err_code = send_file_with_offset(pci->sock_conn, pci->send_file_list[i], client_req.offset);
+
+		if(err_code != 0)
+		{
+			printf("向客户端(%s:%hu)发送 %s 文件失败(Error code: %d)！\n", 
+			       pci->ip, pci->port, pci->send_file_list[i], err_code);
 			break;
 		}
 		else
 		{
-			printf("\n向客户端(%s:%hu)发送 %s 文件成功！\n", pci->ip, pci->port, pci->send_file_list[i]);
+			printf("向客户端(%s:%hu)发送 %s 文件成功！\n", 
+			       pci->ip, pci->port, pci->send_file_list[i]);
 		}
 	}
 
-	// 第 6 步：断开连接（关闭连接套接字）
 	close(pci->sock_conn);
-
-	printf("\n客户端(%s:%hu)下线！\n", pci->ip, pci->port);
-
+	printf("客户端(%s:%hu)下线！\n", pci->ip, pci->port);
 	free(pci);
 
 	return NULL;
 }
 
-
-
-// 将指定文件发送给客户端
-int send_file(int sock, const char* file_path)
+int send_file_with_offset(int sock, const char* file_path, uint64_t offset)
 {
-	file_info_t fi = {""};
-	const char* file_name = NULL;
 	struct stat st;
-	int fd, ret;
-	char buff[1024];
-	uint64_t send_cnt = 0;
-
-
-	// 获取文件模式和大小
 	if(lstat(file_path, &st) == -1)
 	{
 		perror("lstat fail");
 		return 1;
 	}
 
-	fi.mode  = st.st_mode;
-	fi.size  = st.st_size;
-
-	// 获取文件名（不含路径）
-	file_name = strrchr(file_path, '/');
-
-	if(file_name == NULL)
-		file_name = file_path;
-	else
-		file_name++;
-
-	strncpy(fi.name, file_name, sizeof(fi.name) - 1);
-
-	// 发送文件属性信息
-	if(write(sock, &fi, sizeof(fi)) != sizeof(fi))
-	{
-		fprintf(stderr, "send file attribute fail\n");
-		return 2;
-	}
-
-	// 发送文件数据内容
-	fd = open(file_path, O_RDONLY);
-
+	int fd = open(file_path, O_RDONLY);
 	if(fd == -1)
 	{
 		perror("open fail");
+		return 2;
+	}
+
+	if(lseek(fd, offset, SEEK_SET) == -1)
+	{
+		perror("lseek fail");
+		close(fd);
 		return 3;
 	}
 
-	while((ret = read(fd, buff, sizeof(buff))) > 0)
-	{
-			if(write(sock, buff, ret) != ret)
-				break;
+	char buff[8192];
+	uint64_t send_cnt = 0;
+	uint64_t total_to_send = st.st_size - offset;
+	ssize_t ret;
 
-			send_cnt += ret;
+	while(send_cnt < total_to_send)
+	{
+		size_t to_read = (total_to_send - send_cnt) > sizeof(buff) ? sizeof(buff) : (total_to_send - send_cnt);
+		ret = read(fd, buff, to_read);
+		if(ret <= 0)
+			break;
+
+		if(write(sock, buff, ret) != ret)
+			break;
+
+		send_cnt += ret;
+		printf("\r发送进度: %.2f %%", (double)(offset + send_cnt) / st.st_size * 100);
+		fflush(stdout);
 	}
 
 	close(fd);
+	printf("\n");
 
-	if(send_cnt != fi.size)
+	if(send_cnt != total_to_send)
 	{
 		fprintf(stderr, "send file data fail\n");
 		return 4;		
 	}
 
-	return 0;  // 发送文件成功
+	return 0;
 }
-
-

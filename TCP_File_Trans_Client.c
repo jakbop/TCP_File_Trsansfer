@@ -9,144 +9,176 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/stat.h>
 
-// 与服务端完全一致的结构体定义（必须保证内存布局相同）
 #pragma pack(push, 1)
 typedef struct 
 {
-    char name[101];  // 文件名
-    uint32_t mode;   // 文件模式
-    uint64_t size;   // 文件大小
+	char name[101];
+	uint32_t mode;
+	uint64_t size;
+	uint64_t offset;
+	uint8_t enable_resume;
 } file_info_t;
 #pragma pack(pop)
 
-// 函数声明
-int recv_file(int sock);
+int recv_file_with_offset(int sock, const char* file_name, uint64_t offset, uint64_t file_size);
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
-    // 忽略SIGPIPE信号，防止连接断开时程序崩溃
-    signal(SIGPIPE, SIG_IGN);
+	signal(SIGPIPE, SIG_IGN);
 
-    // 校验参数：需要传入服务端IP
-    if (argc != 2)
-    {
-        fprintf(stderr, "用法: %s <服务端IP>\n", argv[0]);
-        return 1;
-    }
+	if(argc != 2)
+	{
+		fprintf(stderr, "用法: %s <服务端IP>\n", argv[0]);
+		return 1;
+	}
 
-    // 1. 创建客户端套接字
-    int sock_cli = socket(AF_INET, SOCK_STREAM, 0);
-    if (-1 == sock_cli)
-    {
-        perror("socket 创建失败");
-        exit(1);
-    }
+	int sock_cli = socket(AF_INET, SOCK_STREAM, 0);
+	if(-1 == sock_cli)
+	{
+		perror("socket 创建失败");
+		exit(1);
+	}
 
-    // 2. 配置服务端地址
-    struct sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(9413);  // 与服务端端口一致
-    if (inet_pton(AF_INET, argv[1], &server_addr.sin_addr) <= 0)
-    {
-        perror("IP地址格式错误");
-        close(sock_cli);
-        exit(1);
-    }
+	struct sockaddr_in server_addr;
+	server_addr.sin_family = AF_INET;
+	server_addr.sin_port = htons(9413);
+	if(inet_pton(AF_INET, argv[1], &server_addr.sin_addr) <= 0)
+	{
+		perror("IP地址格式错误");
+		close(sock_cli);
+		exit(1);
+	}
 
-    // 3. 连接服务端
-    if (connect(sock_cli, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1)
-    {
-        perror("连接服务端失败");
-        close(sock_cli);
-        exit(1);
-    }
-    printf("成功连接到服务端 %s:9413，开始接收文件...\n", argv[1]);
+	if(connect(sock_cli, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1)
+	{
+		perror("连接服务端失败");
+		close(sock_cli);
+		exit(1);
+	}
+	printf("成功连接到服务端 %s:9413，开始接收文件...\n", argv[1]);
 
-    // 循环接收文件（服务端会依次发送所有文件）
-    while (1)
-    {
-        int ret = recv_file(sock_cli);
-        if (ret != 0)
-        {
-            // 连接断开或接收失败，退出循环
-            if (ret == -1)
-                printf("服务端已断开连接\n");
-            else
-                printf("文件接收异常，错误码：%d\n", ret);
-            break;
-        }
-        printf("----------------------------------------\n");
-    }
+	while(1)
+	{
+		file_info_t fi;
+		ssize_t ret = read(sock_cli, &fi, sizeof(fi));
+		if(ret != sizeof(fi))
+		{
+			if(ret == 0)
+				printf("\n服务端已断开连接\n");
+			else
+				perror("\n接收文件信息失败");
+			break;
+		}
 
-    // 4. 关闭套接字
-    close(sock_cli);
-    printf("客户端程序退出\n");
-    return 0;
+		printf("\n----------------------------------------\n");
+		printf("开始接收文件：%s\n", fi.name);
+		printf("文件大小：%lu 字节\n", fi.size);
+		printf("断点续传：%s\n", fi.enable_resume ? "支持" : "不支持");
+
+		uint64_t existing_size = 0;
+		struct stat st;
+		if(stat(fi.name, &st) == 0)
+		{
+			existing_size = st.st_size;
+			if(existing_size < fi.size)
+			{
+				printf("检测到未完成的下载，已下载 %lu 字节 (%.2f%%)，从断点继续...\n", 
+				       existing_size, (double)existing_size / fi.size * 100);
+			}
+			else if(existing_size == fi.size)
+			{
+				printf("文件已完整存在，跳过下载\n");
+				file_info_t req;
+				memset(&req, 0, sizeof(req));
+				req.offset = fi.size;
+				write(sock_cli, &req, sizeof(req));
+				continue;
+			}
+			else
+			{
+				printf("本地文件大于服务端文件，重新下载\n");
+				existing_size = 0;
+			}
+		}
+		else
+		{
+			printf("新文件下载，从头开始\n");
+		}
+
+		file_info_t req;
+		memset(&req, 0, sizeof(req));
+		req.offset = existing_size;
+		if(write(sock_cli, &req, sizeof(req)) != sizeof(req))
+		{
+			perror("发送请求失败");
+			break;
+		}
+
+		int err_code = recv_file_with_offset(sock_cli, fi.name, existing_size, fi.size);
+
+		if(err_code != 0)
+		{
+			printf("文件接收异常，错误码：%d\n", err_code);
+			break;
+		}
+	}
+
+	close(sock_cli);
+	printf("客户端程序退出\n");
+	return 0;
 }
 
-// 接收单个文件的核心函数
-int recv_file(int sock)
+int recv_file_with_offset(int sock, const char* file_name, uint64_t offset, uint64_t file_size)
 {
-    file_info_t fi;
-    char buff[1024];
-    int fd;
-    ssize_t ret;
-    uint64_t recv_cnt = 0;
+	char buff[8192];
+	int fd;
+	ssize_t ret;
+	uint64_t recv_cnt = 0;
+	uint64_t total_to_recv = file_size - offset;
 
-    // 1. 先接收文件信息结构体
-    ret = read(sock, &fi, sizeof(fi));
-    if (ret != sizeof(fi))
-    {
-        // 连接断开
-        if (ret == 0)
-            return -1;
-        perror("接收文件信息失败");
-        return 1;
-    }
+	if(offset == 0)
+	{
+		fd = open(file_name, O_WRONLY | O_CREAT | O_TRUNC, 0664);
+	}
+	else
+	{
+		fd = open(file_name, O_WRONLY | O_APPEND);
+	}
 
-    printf("开始接收文件：%s\n", fi.name);
-    printf("文件大小：%lu 字节\n", fi.size);
+	if(fd == -1)
+	{
+		perror("创建/打开文件失败");
+		return 1;
+	}
 
-    // 2. 创建文件，准备写入
-    fd = open(fi.name, O_WRONLY | O_CREAT | O_TRUNC, 0664);
-    if (fd == -1)
-    {
-        perror("创建文件失败");
-        return 2;
-    }
+	while(recv_cnt < total_to_recv)
+	{
+		size_t need_recv = (total_to_recv - recv_cnt) > sizeof(buff) ? sizeof(buff) : (total_to_recv - recv_cnt);
+		ret = read(sock, buff, need_recv);
 
-    // 3. 循环接收文件数据并写入
-    while (recv_cnt < fi.size)
-    {
-        // 计算本次需要接收的字节数
-        size_t need_recv = (fi.size - recv_cnt) > sizeof(buff) ? sizeof(buff) : (fi.size - recv_cnt);
-        ret = read(sock, buff, need_recv);
+		if(ret <= 0)
+		{
+			perror("接收文件数据失败");
+			close(fd);
+			return 2;
+		}
 
-        if (ret <= 0)
-        {
-            perror("接收文件数据失败");
-            close(fd);
-            return 3;
-        }
+		if(write(fd, buff, ret) != ret)
+		{
+			perror("写入文件失败");
+			close(fd);
+			return 3;
+		}
 
-        // 写入文件
-        if (write(fd, buff, ret) != ret)
-        {
-            perror("写入文件失败");
-            close(fd);
-            return 4;
-        }
+		recv_cnt += ret;
+		printf("\r接收进度: %.2f %%", (double)(offset + recv_cnt) / file_size * 100);
+		fflush(stdout);
+	}
 
-        recv_cnt += ret;
-        // 打印接收进度
-        printf("\r已接收：%.2f %%", (double)recv_cnt / fi.size * 100);
-        fflush(stdout);
-    }
+	close(fd);
+	printf("\n文件 %s 接收完成！\n", file_name);
 
-    // 收尾
-    close(fd);
-    printf("\n文件 %s 接收完成！总大小：%lu 字节\n", fi.name, recv_cnt);
-
-    return 0;
+	return 0;
 }
